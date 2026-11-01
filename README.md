@@ -112,7 +112,7 @@ When you run `pyproject <name>`, it creates the following structure:
 ├── uninstall.sh                # Script to remove via pipx
 ├── commit                      # Quick git add/commit/push script
 ├── clean.sh                    # Removes build artifacts and caches
-├── unit_test                   # Root-level test runner script
+├── ut                          # Root-level test runner script
 ├── src/app/                    # The actual Python package (always named 'app')
 │       ├── __init__.py         # Contains __version__
 │       └── main.py             # Main entry point with main() function
@@ -127,7 +127,7 @@ To contribute to pyproject or verify your local setup, you can run the built-in 
 
 ```bash
 # From the repository root
-./unit_test
+./ut
 
 # Alternatively, run them directly with Python
 cd tests

@@ -68,7 +68,7 @@ version = "1.0.0"
 description = "{description}"
 readme = "README.md"
 requires-python = ">=3.9"
-license = {{text = "MIT"}}
+license = "MIT"
 
 [project.scripts]
 {project_name} = "{PACKAGE_DIR_NAME}.{ENTRY_MODULE}:main"

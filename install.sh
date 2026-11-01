@@ -1,5 +1,5 @@
 #!/bin/bash
-
+rm -rf build
 if pipx list | grep -q "package pyproject"; then
     read -r -p "A previous installation of pyproject exists and will be removed. Do you wish to continue? [y/n]: " answer
 

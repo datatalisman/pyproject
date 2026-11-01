@@ -7,14 +7,40 @@ import subprocess
 import datetime
 from pathlib import Path
 
+try:
+    import readline  # noqa: F401  (lets input() show an editable prefill)
+except ImportError:
+    readline = None
 
-VERSION = "1.2.0"
+
+VERSION = "1.4.0"
 PACKAGE_DIR_NAME = "app"
 ENTRY_MODULE = "main"
 
 
 def is_valid_project_name(name):
     return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", name) is not None
+
+
+def input_with_prefill(prompt, prefill):
+    """input() with an editable default: the prefill text is already in the
+    line, so you can backspace/edit it and hit Enter."""
+    if readline is not None:
+        readline.set_startup_hook(lambda: readline.insert_text(prefill))
+        try:
+            return input(prompt).strip()
+        finally:
+            readline.set_startup_hook()
+    return input(f"{prompt} [{prefill}]: ").strip() or prefill
+
+
+def ask_yes_no(question, default_yes=True):
+    """Ask a yes/no question. [Y] = hitting Enter accepts the default."""
+    suffix = "[Y]" if default_yes else "[y]"
+    answer = input(f"{question} {suffix} ").strip().lower()
+    if not answer:
+        return default_yes
+    return answer in ("y", "yes")
 
 
 def print_help():
@@ -25,17 +51,18 @@ def print_help():
     print("Usage:")
     print("  main.py                          Interactive: create a new project")
     print("  main.py <project_name>           Create a new project")
-    print("  main.py rename <old> <new>       Uninstall old pipx package, rename, install new")
+    print("  main.py -r [old] <new>           Uninstall old pipx package, rename, install new")
+    print("                                     (current dir is used automatically if it is a project)")
+    print("  main.py -d [name]                Uninstall pipx package and delete the directory")
     print("                                     (works from inside or outside the project dir)")
-    print("  main.py delete <name>            Uninstall pipx package and delete the directory")
-    print("                                     (works from inside or outside the project dir)")
-    print("  main.py help                     Show this help")
+    print("  main.py -v                       Show project version, Enter to keep or edit to update")
+    print("  main.py -help                    Show this help (-h also works)")
     print()
     print("Project layout created:")
     print("  <project_name>/")
     print("    src/app/main.py                 <- all your code lives here")
     print("    tests/unit_test.py")
-    print("    pyproject.toml                  <- entry point: <name> = \"app.main:main\"")
+    print('    pyproject.toml                  <- entry point: <name> = "app.main:main"')
     print()
     print("Because the package is always 'app' and the module always 'main.py',")
     print("renaming only touches the project folder name and pyproject.toml.")
@@ -141,13 +168,13 @@ from pathlib import Path
 # Add src directory to Python path so we can import the package
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-import {PACKAGE_DIR_NAME}
+import app
 
 
 class TestProject(unittest.TestCase):
 
     def test_version(self):
-        self.assertEqual({PACKAGE_DIR_NAME}.__version__, "1.0.0")
+        self.assertEqual(app.__version__, "1.0.0")
 
 
 if __name__ == "__main__":
@@ -163,7 +190,7 @@ def create_unit_test_script(tests_dir):
 
 
 def create_unit_test_script2(project_dir):
-    file_path = project_dir / "unit_test"
+    file_path = project_dir / "ut"
     file_path.write_text('''#!/bin/bash
 
 cd "$(dirname "$0")"
@@ -376,22 +403,194 @@ def resolve_project_path(name):
     return None
 
 
+def find_project_path(name):
+    """Resolve a project path, with interactive fallback."""
+    project_path = resolve_project_path(name)
+
+    if project_path is None:
+        print(f"Unable to locate project '{name}'.")
+        path_str = input("Enter path to project: ").strip()
+        candidate = Path(path_str).expanduser()
+        if (candidate / "pyproject.toml").exists():
+            project_path = candidate.resolve()
+        else:
+            print(f"Error: path '{candidate}' does not contain a valid project (no pyproject.toml).")
+            sys.exit(1)
+
+    return project_path
+
+
+def read_project_name(project_path):
+    """Read the project name out of pyproject.toml."""
+    for line in (project_path / "pyproject.toml").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("name"):
+            match = re.search(r'"([^"]*)"', stripped)
+            if match:
+                return match.group(1)
+    return None
+
+
+def read_project_version(project_path):
+    """Read the current version out of pyproject.toml."""
+    for line in (project_path / "pyproject.toml").read_text().splitlines():
+        stripped = line.strip()
+        if stripped.startswith("version"):
+            match = re.search(r'"([^"]*)"', stripped)
+            if match:
+                return match.group(1)
+    return None
+
+
+def suggest_next_version(version):
+    """Suggest the next version by bumping the patch part (1.0.0 -> 1.0.1)."""
+    parts = version.split(".")
+    if len(parts) == 3 and all(p.isdigit() for p in parts):
+        return f"{parts[0]}.{parts[1]}.{int(parts[2]) + 1}"
+    return version
+
+
+def normalize_version(version):
+    """Strip an optional leading 'v' and validate the rest."""
+    version = version.strip()
+    if version.lower().startswith("v"):
+        version = version[1:]
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?", version):
+        return None
+    return version
+
+
+def print_updated_files(updated_files, new_value, summary_line):
+    """Print every updated file, showing only the edited lines plus one
+    line of context above and below (elided parts shown as '.')."""
+    header = "#" * 36 + "  Updated files " + "#" * 37
+    rule = "-" * 88
+    footer = "#" * 88
+
+    print(header)
+    for rel_path, full_path in updated_files:
+        print(rule)
+        print(f"FILE: {rel_path}")
+        if not full_path.exists():
+            print("      (not found, skipped)")
+            continue
+        lines = full_path.read_text().splitlines()
+        # whole-word match only, so e.g. 't5' does not match inside 'list5'
+        word_pattern = re.compile(rf"\b{re.escape(new_value)}\b")
+        matches = [i for i, line in enumerate(lines) if word_pattern.search(line)]
+        if not matches:
+            print("      (no changes)")
+            continue
+        # edited line + one line above and below, if they exist
+        show = set()
+        for i in matches:
+            show.update(range(max(0, i - 1), min(len(lines), i + 2)))
+        prev = None
+        green = "\033[32m" if sys.stdout.isatty() else ""
+        reset = "\033[0m" if sys.stdout.isatty() else ""
+        for i in sorted(show):
+            if prev is not None and i > prev + 1:
+                print("      .")
+            if i in matches:
+                # edited line in green
+                print(f"      {green}{lines[i]}   << updated{reset}")
+            else:
+                print(f"      {lines[i]}")
+            prev = i
+    print(rule)
+    print(summary_line)
+    print(footer)
+
+
+def apply_version_update(project_path, current_version, new_version):
+    """Update the version in pyproject.toml, src/app/__init__.py and
+    tests/unit_test.py so they all stay in sync."""
+    # 1. pyproject.toml
+    pyproject_path = project_path / "pyproject.toml"
+    lines = []
+    for line in pyproject_path.read_text().splitlines():
+        stripped = line.strip()
+        if stripped == f'version = "{current_version}"':
+            line = f'version = "{new_version}"'
+        lines.append(line)
+    pyproject_path.write_text("\n".join(lines) + "\n")
+
+    # 2. src/app/__init__.py
+    init_path = project_path / "src" / PACKAGE_DIR_NAME / "__init__.py"
+    if init_path.exists():
+        init_path.write_text(f'__version__ = "{new_version}"\n')
+
+    # 3. tests/unit_test.py (the hardcoded version in the assert)
+    test_path = project_path / "tests" / "unit_test.py"
+    if test_path.exists():
+        text = test_path.read_text()
+        text = text.replace(f'"{current_version}"', f'"{new_version}"')
+        test_path.write_text(text)
+
+
+def update_version_command():
+    """-v: operate on a project.
+
+    If the current dir is a project (has pyproject.toml) it is used
+    automatically; otherwise a name or path is asked for.
+    """
+    cwd = Path.cwd()
+    if (cwd / "pyproject.toml").exists():
+        project_path = cwd.resolve()
+    else:
+        name = input("Enter project name or path: ").strip()
+        if not name:
+            print("Error: project name cannot be empty.")
+            sys.exit(1)
+        project_path = find_project_path(name)
+
+    current_version = read_project_version(project_path)
+
+    if current_version is None:
+        print("Error: could not find a version in pyproject.toml.")
+        sys.exit(1)
+
+    print(f"[your current version = v{current_version}]")
+
+    suggested = suggest_next_version(current_version)
+    # Editable prefill: backspace and retype to change e.g. v1.0.1 -> v2.0.0
+    new_version = input_with_prefill(
+        f"[Do you want to update to new version | suggested version]: ", f"v{suggested}"
+    )
+
+    # Hit Enter with the suggestion unchanged, or edited text
+    new_version = normalize_version(new_version)
+    if new_version is None:
+        print("Error: that is not a valid version (e.g. v0.0.2 or v1.0.0).")
+        sys.exit(1)
+
+    if new_version == current_version:
+        print(f"Version unchanged (v{current_version}).")
+        return
+
+    if not ask_yes_no(f"Do you want to continue changing version to v{new_version}?"):
+        print("Version update cancelled.")
+        return
+
+    apply_version_update(project_path, current_version, new_version)
+    print_updated_files(
+        [
+            ("pyproject.toml", project_path / "pyproject.toml"),
+            (f"src/{PACKAGE_DIR_NAME}/__init__.py",
+             project_path / "src" / PACKAGE_DIR_NAME / "__init__.py"),
+            ("tests/unit_test.py", project_path / "tests" / "unit_test.py"),
+        ],
+        new_version,
+        f"Version updated: v{current_version} -> v{new_version}",
+    )
+
+
 def rename_project(old_name, new_name):
     if not is_valid_project_name(new_name):
         print(f"Error: invalid project name '{new_name}'.")
         sys.exit(1)
 
-    old_path = resolve_project_path(old_name)
-
-    if old_path is None:
-        print(f"Unable to locate project '{old_name}'.")
-        old_path_str = input("Enter path to project: ").strip()
-        candidate = Path(old_path_str).expanduser()
-        if (candidate / "pyproject.toml").exists():
-            old_path = candidate.resolve()
-        else:
-            print(f"Error: path '{candidate}' does not contain a valid project (no pyproject.toml).")
-            sys.exit(1)
+    old_path = find_project_path(old_name)
 
     old_project_name = old_path.name
     new_path = old_path.parent / new_name
@@ -400,9 +599,9 @@ def rename_project(old_name, new_name):
         print(f"Error: target project '{new_name}' already exists at {new_path}")
         sys.exit(1)
 
-    if new_path.parent == Path.cwd().resolve():
-        # renaming the directory we are sitting in is fine, nothing to do
-        pass
+    if not ask_yes_no(f"Do you want to continue renaming project {old_project_name} to {new_name}?"):
+        print("Rename cancelled.")
+        return
 
     # 1. Uninstall the old pipx package
     if pipx_uninstall(old_project_name):
@@ -426,21 +625,33 @@ def rename_project(old_name, new_name):
     pyproject_new.write_text("\n".join(lines) + "\n")
 
     # 4. Update helper scripts that reference the pipx package name
+    #    (whole-word replace only: renaming 't' to 't5' must not turn
+    #     'pipx list' into 'pipx list5')
+    pattern = re.compile(rf"\b{re.escape(old_project_name)}\b")
     for script_name in ("install.sh", "uninstall.sh"):
         script_path = new_path / script_name
         if script_path.exists():
             text = script_path.read_text()
-            text = text.replace(old_project_name, new_name)
+            text = pattern.sub(new_name, text)
             script_path.write_text(text)
 
-    # 5. Update README
+    # 5. Update README (same whole-word replace)
     readme_path = new_path / "README.md"
     if readme_path.exists():
         text = readme_path.read_text()
-        text = text.replace(old_project_name, new_name)
+        text = pattern.sub(new_name, text)
         readme_path.write_text(text)
 
-    print(f"Project renamed from '{old_project_name}' to '{new_name}' successfully.")
+    print_updated_files(
+        [
+            ("pyproject.toml", new_path / "pyproject.toml"),
+            ("install.sh", new_path / "install.sh"),
+            ("uninstall.sh", new_path / "uninstall.sh"),
+            ("README.md", new_path / "README.md"),
+        ],
+        new_name,
+        f"Project renamed from '{old_project_name}' to '{new_name}' successfully.",
+    )
 
     # 6. Install the new pipx package
     if pipx_install(new_path):
@@ -450,18 +661,7 @@ def rename_project(old_name, new_name):
 
 
 def delete_project(project_name):
-    project_path = resolve_project_path(project_name)
-
-    if project_path is None:
-        print(f"Unable to locate project '{project_name}'.")
-        project_path_str = input("Enter path to project: ").strip()
-        candidate = Path(project_path_str).expanduser()
-        if (candidate / "pyproject.toml").exists():
-            project_path = candidate.resolve()
-        else:
-            print(f"Error: path '{candidate}' does not contain a valid project (no pyproject.toml).")
-            sys.exit(1)
-
+    project_path = find_project_path(project_name)
     name = project_path.name
 
     confirm = input(f"This will uninstall '{name}' from pipx and permanently delete '{project_path}'. Continue? [y/n]: ").strip()
@@ -482,37 +682,54 @@ def delete_project(project_name):
 
 def main():
     args = sys.argv[1:]
+    command = args[0] if args else ""
 
-    if not args:
+    if not command:
         project_name = input("Enter project name: ").strip()
         if not project_name:
             print("Error: project name cannot be empty.")
             sys.exit(1)
         create_project(project_name)
-    elif args[0] in ("help", "-h", "--help"):
+    elif command in ("-help", "-h"):
         print_help()
-    elif args[0] == "rename":
-        if len(args) >= 3:
-            old_name = args[1]
-            new_name = args[2]
-        elif len(args) == 2:
-            old_name = args[1]
-            new_name = input("Enter new project name: ").strip()
-            if not new_name:
-                print("Error: new project name cannot be empty.")
-                sys.exit(1)
-        else:
-            old_name = input("Enter old project name or path: ").strip()
-            if not old_name:
-                print("Error: old project name cannot be empty.")
-                sys.exit(1)
-            new_name = input("Enter new project name: ").strip()
-            if not new_name:
-                print("Error: new project name cannot be empty.")
-                sys.exit(1)
+    elif command in ("-v", "-version"):
+        update_version_command()
+    elif command in ("-r", "-rename"):
+        rest = args[1:]
+        cwd = Path.cwd()
+        in_project = (cwd / "pyproject.toml").exists()
 
+        if in_project:
+            # Current dir is a project: old name comes from pyproject.toml
+            old_name = read_project_name(cwd) or cwd.name
+            print(f"Old project name: {old_name} (from current directory)")
+            if len(rest) >= 1:
+                new_name = rest[0]
+            else:
+                new_name = input("Enter new project name: ").strip()
+                if not new_name:
+                    print("Error: new project name cannot be empty.")
+                    sys.exit(1)
+        else:
+            if len(rest) >= 2:
+                old_name, new_name = rest[0], rest[1]
+            elif len(rest) == 1:
+                old_name = rest[0]
+                new_name = input("Enter new project name: ").strip()
+                if not new_name:
+                    print("Error: new project name cannot be empty.")
+                    sys.exit(1)
+            else:
+                old_name = input("Enter old project name or path: ").strip()
+                if not old_name:
+                    print("Error: old project name cannot be empty.")
+                    sys.exit(1)
+                new_name = input("Enter new project name: ").strip()
+                if not new_name:
+                    print("Error: new project name cannot be empty.")
+                    sys.exit(1)
         rename_project(old_name, new_name)
-    elif args[0] in ("delete", "rm", "remove"):
+    elif command in ("-d", "-delete", "-rm", "-remove"):
         if len(args) >= 2:
             project_name = args[1]
         else:
@@ -520,10 +737,9 @@ def main():
             if not project_name:
                 print("Error: project name cannot be empty.")
                 sys.exit(1)
-
         delete_project(project_name)
     else:
-        project_name = args[0]
+        project_name = command
         create_project(project_name)
 
 

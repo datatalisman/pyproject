@@ -119,6 +119,13 @@ pipx install .
     file_path.write_text(content)
     file_path.chmod(0o755)
 
+def create_run_script(project_dir, project_name):
+     content = f'''#!/bin/bash
+python3 src/app/main.py
+'''
+     file_path = project_dir / "run.sh"
+     file_path.write_text(content)
+     file_path.chmod(0o755)
 
 def create_uninstall_script(project_dir, project_name):
     file_path = project_dir / "uninstall.sh"
@@ -300,6 +307,7 @@ def create_project(project_name):
     create_main_file(package_dir, project_name)
     create_install_script(project_dir, project_name)
     create_uninstall_script(project_dir, project_name)
+    create_run_script(project_dir, project_name)
     create_unit_test(tests_dir, project_name)
     create_unit_test_script(tests_dir)
     create_unit_test_script2(project_dir)
